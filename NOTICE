@@ -1,0 +1,4 @@
+src/P4Font5x7.h contains the classic 5x7 bitmap font table ("glcdfont") that is
+widely used in embedded projects and is also shipped with Adafruit GFX
+(BSD licence, Copyright Adafruit Industries). If you redistribute this file,
+keep that attribution in mind.

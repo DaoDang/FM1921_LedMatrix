@@ -1,0 +1,17 @@
+{
+  "name": "FM1921_LedMatrix",
+  "version": "1.0.0",
+  "description": "Chainable driver for P4 32x32 RGB LED panels (FM1921 / 16S2, shift-register row select) on ESP32: RGB colour, brightness, text, scrolling.",
+  "keywords": ["led", "matrix", "p4", "rgb", "panel", "display", "esp32", "fm1921", "hub75"],
+  "repository": { "type": "git", "url": "https://github.com/daodang/FM1921_LedMatrix.git" },
+  "authors": [{ "name": "Dao Dang", "email": "dangdv78@gmail.com" }],
+  "license": "DANG",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "headers": ["P4Panel32.h", "P4Console.h"],
+  "examples": [
+    { "name": "BasicDrawing", "base": "examples/BasicDrawing", "files": ["BasicDrawing.ino"] },
+    { "name": "TextAndScroll", "base": "examples/TextAndScroll", "files": ["TextAndScroll.ino"] },
+    { "name": "SerialConsole", "base": "examples/SerialConsole", "files": ["SerialConsole.ino"] }
+  ]
+}
