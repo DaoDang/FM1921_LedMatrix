@@ -2,3 +2,11 @@ src/P4Font5x7.h contains the classic 5x7 bitmap font table ("glcdfont") that is
 widely used in embedded projects and is also shipped with Adafruit GFX
 (BSD licence, Copyright Adafruit Industries). If you redistribute this file,
 keep that attribution in mind.
+
+src/DejaVuVN_9.h, src/DejaVuVN_12.h and src/DejaVuVN_16.h (and any font generated with
+extras/fontgen/make_vn_font.py from DejaVu Sans) contain bitmaps rendered from the DejaVu Sans
+font: "Fonts are (c) Bitstream (see below). DejaVu changes are in public domain."
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera is a trademark of
+Bitstream, Inc. The generated fonts are named DejaVuVN_* (no "Bitstream" or "Vera" in the name),
+as the licence requires for modified fonts. The full licence text is in extras/fontgen/LICENSE_DEJAVU
+(also at https://dejavu-fonts.github.io/License.html); keep it when you redistribute these files.

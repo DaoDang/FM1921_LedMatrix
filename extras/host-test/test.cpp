@@ -8,6 +8,9 @@ unsigned long g_us = 0; SerialC Serial;
 #include "P4Panel32.h"
 #include "P4Console.h"
 #undef private
+#include "DejaVuVN_9.h"
+#include "DejaVuVN_12.h"
+#include "DejaVuVN_16.h"
 
 
 // ---- emulator of the fitted panel model; pins are configurable ----
@@ -64,6 +67,53 @@ static void checkAll(P4Panel32& P, const char* name, bool fx = false, bool fy = 
 }
 static void cmd(P4Console& con, const char* s) { Serial.q.push_back(s); con.handle(); }
 
+// ---- helpers for the font / UTF-8 tests (independent reference implementations) ----
+static uint32_t refU8(const char*& s) {          // strict decoder for VALID strings only
+  const unsigned char* p = (const unsigned char*)s; uint32_t c = *p++;
+  if (c < 0x80) { s = (const char*)p; return c; }
+  int n = (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : 3;
+  uint32_t cp = c & (0x3F >> n);
+  while (n--) cp = (cp << 6) | (*p++ & 0x3F);
+  s = (const char*)p; return cp;
+}
+static bool validUtf8(const char* s) {
+  const unsigned char* p = (const unsigned char*)s;
+  while (*p) {
+    int n = *p < 0x80 ? 0 : (*p & 0xE0) == 0xC0 ? 1 : (*p & 0xF0) == 0xE0 ? 2 : (*p & 0xF8) == 0xF0 ? 3 : -1;
+    if (n < 0) return false;
+    p++;
+    while (n--) { if ((*p & 0xC0) != 0x80) return false; p++; }
+  }
+  return true;
+}
+static int refWidth(const P4Font* f, const char* s) {       // sum of advances minus the empty tail of the last glyph
+  int w = 0, tail = 0;
+  while (*s) { const P4Glyph* g = P4FontFind(f, refU8(s)); w += g->adv; tail = g->adv - (g->dx + g->w); }
+  if (tail < 0) tail = 0;
+  return w - tail;
+}
+static std::vector<char> snap(const P4Panel32& P) {          // lit pixels of the whole frame buffer
+  std::vector<char> v; for (int i = 0; i < 32 * P.W_; i++) v.push_back(P.fb_[i].r | P.fb_[i].g | P.fb_[i].b ? 1 : 0); return v;
+}
+static int litCount(const std::vector<char>& v) { int n = 0; for (char c : v) n += c; return n; }
+static void inkRows(const P4Panel32& P, int* top, int* bottom) {
+  *top = 99; *bottom = -1;
+  for (int y = 0; y < 32; y++) for (int x = 0; x < P.W_; x++)
+    if (P.fb_[y * P.W_ + x].r | P.fb_[y * P.W_ + x].g | P.fb_[y * P.W_ + x].b) { if (y < *top) *top = y; if (y > *bottom) *bottom = y; }
+}
+#define CHECK_FONT(F) do { \
+    const P4Font& f = F; char m[96]; \
+    snprintf(m, sizeof m, #F ": codes sorted, one glyph per code"); \
+    bool ok = f.count == sizeof(F##_codes) / sizeof(F##_codes[0]) && f.count == sizeof(F##_glyphs) / sizeof(F##_glyphs[0]); \
+    for (int i = 1; i < f.count; i++) if (f.codes[i] <= f.codes[i - 1]) ok = false; \
+    CHECK(ok, m); \
+    snprintf(m, sizeof m, #F ": bitmap offsets and glyph boxes inside the cell"); \
+    ok = f.ascent <= f.height; \
+    for (int i = 0; i < f.count; i++) { const P4Glyph& g = f.glyphs[i]; \
+      if (g.offset + (g.w * g.h + 7) / 8 > (int)sizeof(F##_bitmap)) ok = false; \
+      if ((g.w * g.h) != 0 && (f.ascent + g.dy < 0 || f.ascent + g.dy + g.h > f.height)) ok = false; } \
+    CHECK(ok, m); } while (0)
+
 int main() {
   // ---------- default pins ----------
   {
@@ -108,6 +158,91 @@ int main() {
     int seenMin = 999;
     for (int i = 0; i < 300; i++) { g_us += 41000; P.update(); if (P.scrX_ < seenMin) seenMin = P.scrX_; }
     CHECK(seenMin < 0 && P.scrX_ <= 64, "scroll moved & wrapped"); P.stopScroll(); CHECK(!P.scrolling(), "stop");
+
+    // ---------- Vietnamese / UTF-8 fonts ----------
+    {
+      CHECK_FONT(DejaVuVN_9); CHECK_FONT(DejaVuVN_12); CHECK_FONT(DejaVuVN_16);
+      CHECK(DejaVuVN_9.height == 13 && DejaVuVN_12.height == 17 && DejaVuVN_16.height == 21, "font cell heights");
+
+      // every Vietnamese letter (67 lower + 67 upper) and the extras exist in every font
+      const char* vn =
+        "àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ"
+        "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ"
+        "°±×÷·–—‘’“”…•₫€£©";
+      const P4Font* fonts[3] = {&DejaVuVN_9, &DejaVuVN_12, &DejaVuVN_16};
+      int missing = 0, letters = 0;
+      for (int k = 0; k < 3; k++) for (const char* s = vn; *s; ) { uint32_t cp = refU8(s); if (!P4FontFind(fonts[k], cp)) missing++; if (k == 0) letters++; }
+      CHECK(missing == 0 && letters == 134 + 17, "all Vietnamese letters + extras in all fonts");
+      for (uint32_t cp = 32; cp < 127; cp++) CHECK(P4FontFind(&DejaVuVN_12, cp) != NULL, "ASCII glyph present");
+
+      // setFont / metrics / default font
+      P.setFont(&DejaVuVN_12);
+      CHECK(P.font() == &DejaVuVN_12 && P.fontHeight() == 17 && P.fontAscent() == 14, "setFont metrics");
+      P.setFont(NULL);
+      CHECK(P.font() == NULL && P.fontHeight() == 7 && P.textWidth("Hi", 2) == 22, "setFont(NULL) = 5x7");
+
+      // the library's UTF-8 path gives the same width as the reference decoder, and scales with size
+      const char* tests[] = {"Hà Nội", "Việt Nam", "Chào mừng bạn đến với Việt Nam – ESP32-S3!", "Ấ", "x"};
+      for (int k = 0; k < 3; k++) {
+        P.setFont(fonts[k]);
+        for (const char* t : tests) {
+          char m[160]; snprintf(m, sizeof m, "textWidth font %d: %s", k, t);
+          CHECK(P.textWidth(t) == refWidth(fonts[k], t), m);
+          CHECK(P.textWidth(t, 2) == 2 * P.textWidth(t, 1), "textWidth scales with size");
+        }
+      }
+      CHECK(P.textWidth("") == 0, "empty text width");
+
+      // a precomposed letter draws the base letter plus its marks (dot below, circumflex above)
+      P.setFont(&DejaVuVN_12);
+      P.clear(); P.drawText(0, 0, "e", P4_WHITE); int t1, b1; inkRows(P, &t1, &b1); int n1 = litCount(snap(P));
+      P.clear(); P.drawText(0, 0, "ệ", P4_WHITE); int t2, b2; inkRows(P, &t2, &b2); int n2 = litCount(snap(P));
+      CHECK(n2 > n1 && t2 < t1 && b2 > b1, "ệ has marks above and below e");
+
+      // invalid UTF-8 never crashes and shows '?'
+      P.setFont(&DejaVuVN_12);
+      struct { const char* bad; const char* same; const char* what; } inv[] = {
+        {"\xC3", "?", "truncated at end"}, {"\x80", "?", "stray continuation"}, {"\xFF", "?", "invalid lead"},
+        {"\xC3(", "?(", "truncated, resumes"}, {"\xC0\x80", "?", "overlong"}, {"\xED\xA0\x80", "?", "surrogate"},
+        {"\xF0\x9F\x98\x80", "?", "emoji not in font"}, {"\xE4\xB8\xAD", "?", "CJK not in font"},
+      };
+      for (auto& c : inv) {
+        P.clear(); P.drawText(0, 0, c.bad, P4_WHITE); std::vector<char> a = snap(P);
+        P.clear(); P.drawText(0, 0, c.same, P4_WHITE); std::vector<char> b = snap(P);
+        char m[96]; snprintf(m, sizeof m, "invalid UTF-8: %s", c.what); CHECK(a == b && litCount(a) > 0, m);
+      }
+      // built-in 5x7 font: one UTF-8 character that it lacks is ONE '?' (not one per byte)
+      P.setFont(NULL);
+      CHECK(P.textWidth("é") == 5 && P.textWidth("Việt") == 4 * 6 - 1, "5x7 counts characters, not bytes");
+      { P.clear(); P.drawText(0, 0, "Việt", P4_WHITE); std::vector<char> a = snap(P); P.clear(); P.drawText(0, 0, "Vi?t", P4_WHITE); CHECK(a == snap(P), "5x7: a UTF-8 character it lacks becomes one '?'"); }
+
+      // example layout: 16 px line on top (y = 0), 9 px line at the bottom (y = 32 - height), no overlap
+      P.setFont(&DejaVuVN_16); P.clear(); P.drawTextCentered(0, "Hà Nội", P4_YELLOW); int tt, tb; inkRows(P, &tt, &tb);
+      CHECK(P.textWidth("Hà Nội") <= 64, "example top line fits 64 px");
+      P.setFont(&DejaVuVN_9);  P.clear(); P.drawTextCentered(32 - P.fontHeight(), "Việt Nam", P4_CYAN); int bt, bb; inkRows(P, &bt, &bb);
+      CHECK(P.textWidth("Việt Nam") <= 64, "example bottom line fits 64 px");
+      printf("example rows: top line %d..%d, bottom line %d..%d\n", tt, tb, bt, bb);
+      CHECK(tt >= 0 && tb < bt && bb <= 31, "example lines do not overlap and stay on the panel");
+      // the scrolling message stays inside the 32 rows when centred with the 16 px font
+      { const char* msg = "Chào mừng bạn đến với Việt Nam – ESP32-S3 + P4 LED panel!";
+        int y = (32 - DejaVuVN_16.height) / 2; bool inside = true;
+        for (const char* s = msg; *s; ) { const P4Glyph* g = P4FontFind(&DejaVuVN_16, refU8(s)); int top = y + DejaVuVN_16.ascent + g->dy; if ((g->w * g->h) != 0 && (top < 0 || top + g->h > 32)) inside = false; }
+        CHECK(inside, "scroll message inside the panel rows"); }
+
+      // scrolling Vietnamese text: font is remembered, long text is cut on a character boundary
+      P.setFont(&DejaVuVN_16);
+      std::string longText; while (longText.size() < 400) longText += "Việt Nam ";
+      P.startScroll(longText.c_str(), 5, P4_YELLOW, 40);
+      CHECK(P.scrFont_ == &DejaVuVN_16 && validUtf8(P.scrText_) && strlen(P.scrText_) > 200, "startScroll keeps font, cuts at a UTF-8 boundary");
+      P.setFont(NULL);                                                 // later setFont() does not change a running scroll
+      P.startScroll("Hà Nội", 5, P4_YELLOW, 40);                      // 5x7 now
+      CHECK(P.scrFont_ == NULL, "scroll font follows setFont at call time");
+      P.setFont(&DejaVuVN_16); P.startScroll("Hà Nội", 5, P4_YELLOW, 40); P.setFont(NULL);
+      int seenMin2 = 999; for (int i = 0; i < 400; i++) { g_us += 41000; P.update(); if (P.scrX_ < seenMin2) seenMin2 = P.scrX_; }
+      CHECK(seenMin2 <= -P.textWidthWith(&DejaVuVN_16, "Hà Nội", 1) && P.scrX_ <= 64, "scroll with font scrolls off and wraps");
+      P.stopScroll();
+      P.setFont(NULL);
+    }
 
     // colour helpers
     uint32_t c; CHECK(P4Panel32::parseColor("#FF8000", &c) && c == 0xFF8000, "hex");

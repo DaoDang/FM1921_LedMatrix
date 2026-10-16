@@ -31,8 +31,8 @@ static inline void nopn(int n) { for (int i = 0; i < n; i++) __asm__ __volatile_
 P4Panel32::P4Panel32()
   : fb_(NULL), plane_(NULL), nPanels_(0), W_(0), planes_(5), unitUs_(10), bri_(255),
     gamma10_(22), spd_(3), dclkSel_(0), sdinSel_(2), mk_(0), inv_(false), chainLen_(16),
-    flipX_(false), flipY_(false), dirty_(true), begun_(false),
-    scrolling_(false), scrX_(0), scrY_(0), scrMs_(40), scrSize_(1), scrColor_(0xFFFFFF), lastScr_(0),
+    flipX_(false), flipY_(false), dirty_(true), begun_(false), font_(NULL),
+    scrolling_(false), scrFont_(NULL), scrX_(0), scrY_(0), scrMs_(40), scrSize_(1), scrColor_(0xFFFFFF), lastScr_(0),
     clkSetReg_(0), clkClrReg_(0), clkBit_(0) {
   pin_ = P4DefaultPins();
   scrText_[0] = 0;
@@ -172,26 +172,96 @@ void P4Panel32::drawLine(int x0, int y0, int x1, int y1, uint32_t c) {
   }
 }
 
-void P4Panel32::drawChar(int x, int y, char ch, uint32_t c, int sz) {
-  if (sz < 1) sz = 1;
-  if (ch < 32 || ch > 126) ch = '?';
-  const uint8_t* g = &P4_FONT5x7[(ch - 32) * 5];
-  for (int cx = 0; cx < 5; cx++) {
-    uint8_t bits = g[cx];
-    for (int cy = 0; cy < 7; cy++)
-      if (bits & (1 << cy)) fillRect(x + cx * sz, y + cy * sz, sz, sz, c);
+// ---------------------------------------------------------------- text (UTF-8)
+// Decode one code point and advance `s` past it. Invalid, overlong or truncated
+// sequences (and stray continuation bytes) give '?'; a truncated sequence resumes at the
+// offending byte, so the rest of the string is still decoded.
+static uint32_t utf8Next(const char*& s) {
+  const uint8_t* p = (const uint8_t*)s;
+  uint32_t c = *p++;
+  if (c < 0x80) { s = (const char*)p; return c; }
+  int n; uint32_t cp, minCp;
+  if      ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; minCp = 0x80; }
+  else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; minCp = 0x800; }
+  else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; minCp = 0x10000; }
+  else { s = (const char*)p; return '?'; }
+  for (int i = 0; i < n; i++) {
+    if ((*p & 0xC0) != 0x80) { s = (const char*)p; return '?'; }
+    cp = (cp << 6) | (*p++ & 0x3F);
   }
+  s = (const char*)p;
+  if (cp < minCp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return '?';
+  return cp;
 }
 
-int P4Panel32::textWidth(const char* s, int sz) const {
+// Glyph of the font for a code point; falls back to '?' when the font lacks it.
+static const P4Glyph* findGlyph(const P4Font* f, uint32_t cp) {
+  const P4Glyph* g = P4FontFind(f, cp);
+  return g ? g : P4FontFind(f, '?');
+}
+
+// Draws one glyph with its cell top-left at (x, y); returns the horizontal advance in pixels.
+int P4Panel32::drawGlyphWith(const P4Font* f, int x, int y, uint32_t cp, uint32_t c, int sz) {
   if (sz < 1) sz = 1;
-  int n = (int)strlen(s);
-  return n ? n * 6 * sz - sz : 0;
+  if (!f) {                                          // built-in 5x7, ASCII only
+    if (cp < 32 || cp > 126) cp = '?';
+    const uint8_t* g = &P4_FONT5x7[(cp - 32) * 5];
+    for (int cx = 0; cx < 5; cx++) {
+      uint8_t bits = g[cx];
+      for (int cy = 0; cy < 7; cy++)
+        if (bits & (1 << cy)) fillRect(x + cx * sz, y + cy * sz, sz, sz, c);
+    }
+    return 6 * sz;
+  }
+  const P4Glyph* g = findGlyph(f, cp);
+  if (!g) return 0;
+  const uint8_t* bm = f->bitmap + g->offset;
+  const int bx = x + g->dx * sz;
+  const int by = y + (f->ascent + g->dy) * sz;
+  int bit = 0;
+  for (int r = 0; r < g->h; r++)
+    for (int k = 0; k < g->w; k++, bit++)
+      if (bm[bit >> 3] & (0x80 >> (bit & 7))) fillRect(bx + k * sz, by + r * sz, sz, sz, c);
+  return g->adv * sz;
+}
+
+int P4Panel32::drawGlyph(int x, int y, uint32_t cp, uint32_t c, int sz) {
+  return drawGlyphWith(font_, x, y, cp, c, sz);
+}
+
+void P4Panel32::drawChar(int x, int y, char ch, uint32_t c, int sz) {
+  drawGlyphWith(font_, x, y, (uint8_t)ch, c, sz);
+}
+
+// Width of the ink-relevant part of the text: the sum of the advances minus the empty space
+// after the last glyph (so centred text looks centred).
+int P4Panel32::textWidthWith(const P4Font* f, const char* s, int sz) const {
+  if (sz < 1) sz = 1;
+  if (!f) {
+    int n = 0;
+    while (*s) { utf8Next(s); n++; }
+    return n ? n * 6 * sz - sz : 0;
+  }
+  int w = 0, tail = 0;
+  while (*s) {
+    const P4Glyph* g = findGlyph(f, utf8Next(s));
+    if (!g) continue;
+    w += g->adv;
+    tail = g->adv - (g->dx + g->w);
+  }
+  if (tail < 0) tail = 0;
+  return w > tail ? (w - tail) * sz : 0;
+}
+
+int P4Panel32::textWidth(const char* s, int sz) const { return textWidthWith(font_, s, sz); }
+
+void P4Panel32::drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t c, int sz) {
+  if (sz < 1) sz = 1;
+  while (*s) x += drawGlyphWith(f, x, y, utf8Next(s), c, sz);
 }
 
 void P4Panel32::drawText(int x, int y, const char* s, uint32_t c, int sz) {
-  if (sz < 1) sz = 1;
-  for (; *s; s++) { drawChar(x, y, *s, c, sz); x += 6 * sz; }
+  drawTextWith(font_, x, y, s, c, sz);
 }
 
 void P4Panel32::drawTextCentered(int y, const char* s, uint32_t c, int sz) {
@@ -260,6 +330,18 @@ bool P4Panel32::parseColor(const char* s, uint32_t* out) {
 void P4Panel32::startScroll(const char* text, int y, uint32_t c, uint16_t ms, int sz) {
   strncpy(scrText_, text, sizeof(scrText_) - 1);
   scrText_[sizeof(scrText_) - 1] = 0;
+  // a long text may have been cut inside a multi-byte UTF-8 character: drop the partial one
+  size_t n = strlen(scrText_);
+  if (strlen(text) > n) {                                                    // text was cut
+    size_t i = n;
+    while (i > 0 && ((uint8_t)scrText_[i - 1] & 0xC0) == 0x80) i--;          // skip continuation bytes
+    if (i > 0 && (uint8_t)scrText_[i - 1] >= 0xC0) {                         // scrText_[i-1] = lead byte
+      uint8_t lead = (uint8_t)scrText_[i - 1];
+      size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
+      if (n - (i - 1) < need) scrText_[i - 1] = 0;
+    }
+  }
+  scrFont_ = font_;
   scrY_ = y; scrColor_ = c; scrMs_ = clampi(ms, 5, 2000); scrSize_ = clampi(sz, 1, 4);
   scrX_ = W_; lastScr_ = 0; scrolling_ = true;
 }
@@ -270,9 +352,9 @@ void P4Panel32::updateScroll() {
   if (now - lastScr_ < (unsigned long)scrMs_) return;
   lastScr_ = now;
   clear();
-  drawText(scrX_, scrY_, scrText_, scrColor_, scrSize_);
+  drawTextWith(scrFont_, scrX_, scrY_, scrText_, scrColor_, scrSize_);
   scrX_--;
-  if (scrX_ < -textWidth(scrText_, scrSize_)) scrX_ = W_;
+  if (scrX_ < -textWidthWith(scrFont_, scrText_, scrSize_)) scrX_ = W_;
 }
 
 // ---------------------------------------------------------------- image -> bit planes

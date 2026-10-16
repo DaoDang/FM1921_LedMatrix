@@ -1,0 +1,3 @@
+freetype-py
+pillow        # only for --preview
+matplotlib    # optional: ships DejaVuSans.ttf, so --ttf is not needed

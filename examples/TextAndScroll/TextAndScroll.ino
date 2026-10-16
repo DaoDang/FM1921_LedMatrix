@@ -1,5 +1,5 @@
 // P4Panel32 - TextAndScroll
-// Shows static text for 5 s, then a scrolling message. 5x7 font, ASCII only (no Vietnamese accents).
+// Shows static text for 5 s, then a scrolling message. 5x7 font, ASCII only. For Vietnamese accents see examples/VietnameseText.
 
 #include <P4Panel32.h>
 

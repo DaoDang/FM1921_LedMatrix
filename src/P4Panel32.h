@@ -1,15 +1,17 @@
 // P4Panel32 - driver for P4 32x32 RGB LED panels (label e.g. "FM1921 ... 16S2")
 // whose row select behaves like a shift register (A = DCLK, C = SDIN).
 // Chainable (N modules in series), 24-bit colour via BCM + gamma, brightness,
-// 5x7 text and scrolling text.  Target: ESP32 family (tested: ESP32-S3).
+// text (built-in 5x7 or UTF-8 bitmap fonts, e.g. Vietnamese) and scrolling text.
+// Target: ESP32 family (tested: ESP32-S3).
 //
 // MIT licence - see LICENSE.
 #ifndef P4PANEL32_H
 #define P4PANEL32_H
 
 #include <Arduino.h>
+#include "P4Font.h"
 
-#define P4PANEL32_VERSION "1.0.0"
+#define P4PANEL32_VERSION "1.1.0"
 
 // GPIO assignment. r1..b2 (colour data) MUST be GPIO 0..31 (fast set/clear
 // uses one 32-bit register). a,b,c,d,lat,oe,clk may be any output GPIO.
@@ -79,13 +81,26 @@ public:
   void fillRect(int x, int y, int w, int h, uint32_t rgb);
   void drawColorTest();                                      // hue ramp + grey ramp
 
-  // 5x7 font, ASCII only. Each glyph occupies 6*size pixels horizontally.
+  // ---- text ---------------------------------------------------------------
+  // Strings are UTF-8. y is the TOP of the line cell (baseline = y + fontAscent()).
+  // `size` scales the font by an integer factor (glyph pixels become size x size blocks).
+  // Default font: built-in 5x7, ASCII only (each glyph 6*size px wide; other characters -> '?').
+  // With setFont() the text can contain any character the font has (e.g. Vietnamese).
   void drawChar(int x, int y, char ch, uint32_t rgb, int size = 1);
+  int  drawGlyph(int x, int y, uint32_t codepoint, uint32_t rgb, int size = 1);   // returns the advance in px
   void drawText(int x, int y, const char* s, uint32_t rgb, int size = 1);
   void drawTextCentered(int y, const char* s, uint32_t rgb, int size = 1);
   int  textWidth(const char* s, int size = 1) const;
 
-  // Right-to-left scrolling text (processed in update()/show()).
+  // Bitmap font for drawChar/drawText/startScroll, e.g. setFont(&DejaVuVN_12) after
+  // #include <DejaVuVN_12.h>  (fonts are made by extras/fontgen/make_vn_font.py).
+  // setFont(NULL) = built-in 5x7 font (default). The font must stay valid (use the generated ones).
+  void setFont(const P4Font* f)       { font_ = f; }
+  const P4Font* font() const          { return font_; }
+  int  fontHeight() const             { return font_ ? font_->height : 7; }   // line cell height, size 1
+  int  fontAscent() const             { return font_ ? font_->ascent : 7; }   // top of cell -> baseline, size 1
+
+  // Right-to-left scrolling text (processed in update()/show()). Uses the font set at call time.
   void startScroll(const char* text, int y, uint32_t rgb, uint16_t msPerStep = 40, int size = 1);
   void stopScroll() { scrolling_ = false; }
   bool scrolling() const { return scrolling_; }
@@ -136,6 +151,9 @@ private:
   void shiftPlane(const uint8_t* m);
   int  linePin(int line) const;
   void updateScroll();
+  int  drawGlyphWith(const P4Font* f, int x, int y, uint32_t cp, uint32_t rgb, int size);
+  void drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t rgb, int size);
+  int  textWidthWith(const P4Font* f, const char* s, int size) const;
 
   Rgb*      fb_;                   // [PANEL_H][W_]
   uint8_t*  plane_;                // [MAX_PLANES][16][W_], 6 bit: R1 G1 B1 R2 G2 B2
@@ -155,9 +173,11 @@ private:
   bool      flipY_;
   bool      dirty_;
   bool      begun_;
+  const P4Font* font_;
 
   bool      scrolling_;
-  char      scrText_[120];
+  const P4Font* scrFont_;
+  char      scrText_[240];         // UTF-8 (Vietnamese letters take 2-3 bytes)
   int       scrX_, scrY_, scrMs_, scrSize_;
   uint32_t  scrColor_;
   unsigned long lastScr_;
