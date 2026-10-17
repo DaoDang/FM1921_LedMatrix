@@ -11,7 +11,7 @@
 #include <Arduino.h>
 #include "P4Font.h"
 
-#define P4PANEL32_VERSION "1.1.0"
+#define P4PANEL32_VERSION "1.2.0"
 
 // GPIO assignment. r1..b2 (colour data) MUST be GPIO 0..31 (fast set/clear
 // uses one 32-bit register). a,b,c,d,lat,oe,clk may be any output GPIO.
@@ -41,7 +41,8 @@ public:
     PANEL_W    = 32,   // pixels per module (width)
     PANEL_H    = 32,   // pixels per module (height)
     MAX_PLANES = 8,    // max bit planes (colour depth per channel)
-    MAX_PANELS = 16    // hard limit on chained modules (RAM ~ 7 KB per module)
+    MAX_PANELS = 16,   // hard limit on chained modules (RAM ~ 7 KB per module)
+    MAX_SCROLLS = 4    // scrolling-text areas that can run at the same time
   };
 
   P4Panel32();
@@ -81,6 +82,14 @@ public:
   void fillRect(int x, int y, int w, int h, uint32_t rgb);
   void drawColorTest();                                      // hue ramp + grey ramp
 
+  // ---- display areas (clipping) --------------------------------------------
+  // setClip() limits ALL drawing (pixels, shapes, text) to the rectangle (x, y, w, h), so something
+  // drawn for one area can never spill into another. clearClip() removes the limit.
+  // clear() is not affected (it always clears the whole panel); clearRect() blacks out one area.
+  void setClip(int x, int y, int w, int h);
+  void clearClip();
+  void clearRect(int x, int y, int w, int h) { fillRect(x, y, w, h, P4_BLACK); }
+
   // ---- text ---------------------------------------------------------------
   // Strings are UTF-8. y is the TOP of the line cell (baseline = y + fontAscent()).
   // `size` scales the font by an integer factor (glyph pixels become size x size blocks).
@@ -88,7 +97,7 @@ public:
   // With setFont() the text can contain any character the font has (e.g. Vietnamese).
   void drawChar(int x, int y, char ch, uint32_t rgb, int size = 1);
   int  drawGlyph(int x, int y, uint32_t codepoint, uint32_t rgb, int size = 1);   // returns the advance in px
-  void drawText(int x, int y, const char* s, uint32_t rgb, int size = 1);
+  int  drawText(int x, int y, const char* s, uint32_t rgb, int size = 1);         // returns the x after the last glyph
   void drawTextCentered(int y, const char* s, uint32_t rgb, int size = 1);
   int  textWidth(const char* s, int size = 1) const;
 
@@ -100,10 +109,23 @@ public:
   int  fontHeight() const             { return font_ ? font_->height : 7; }   // line cell height, size 1
   int  fontAscent() const             { return font_ ? font_->ascent : 7; }   // top of cell -> baseline, size 1
 
-  // Right-to-left scrolling text (processed in update()/show()). Uses the font set at call time.
+  // ---- scrolling text (right to left, processed in update()/show()) ---------
+  // Both use the font that is set when they are called and move one pixel every msPerStep.
+  //
+  // startScroll(): the whole panel is the scroll area (it is cleared at every step), the text line
+  //   cell starts at row y. One scroller; it stops any other running scroller.
   void startScroll(const char* text, int y, uint32_t rgb, uint16_t msPerStep = 40, int size = 1);
-  void stopScroll() { scrolling_ = false; }
-  bool scrolling() const { return scrolling_; }
+  // startScrollIn(): scrolls inside the rectangle (x, y, w, h) ONLY. Only that rectangle is redrawn,
+  //   the rest of the panel (e.g. a static clock line) is not touched, and the text is clipped to it.
+  //   The text line cell is centred vertically in the rectangle (top = y + (h - fontHeight()*size) / 2).
+  //   Up to MAX_SCROLLS rectangles run at the same time. Starting a scroll for the same rectangle
+  //   again replaces its text (restarts from the right edge). Returns the slot 0..MAX_SCROLLS-1,
+  //   or -1 if the rectangle is empty or all slots are in use. Do not mix with startScroll().
+  int  startScrollIn(int x, int y, int w, int h, const char* text, uint32_t rgb,
+                     uint16_t msPerStep = 40, int size = 1);
+  void stopScroll();                  // stop all scrollers (the last picture stays on the panel)
+  void stopScroll(int slot);          // stop one slot (value returned by startScrollIn)
+  bool scrolling() const;             // true while any scroller runs
 
   // ---- colours -----------------------------------------------------------
   static uint32_t color(uint8_t r, uint8_t g, uint8_t b) {
@@ -145,6 +167,18 @@ public:
 
 private:
   struct Rgb { uint8_t r, g, b; };
+  struct Scroller {
+    bool          active;
+    const P4Font* font;
+    char          text[240];         // UTF-8 (Vietnamese letters take 2-3 bytes)
+    int           rx, ry, rw, rh;    // scroll area: cleared and clipped at every step
+    int           ty;                // top of the text line cell
+    int           x;                 // current x of the start of the text
+    int           textW;             // text width, cached
+    int           ms, size;
+    uint32_t      color;
+    unsigned long last;
+  };
 
   void buildGamma();
   void buildMasks();
@@ -152,8 +186,10 @@ private:
   int  linePin(int line) const;
   void updateScroll();
   int  drawGlyphWith(const P4Font* f, int x, int y, uint32_t cp, uint32_t rgb, int size);
-  void drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t rgb, int size);
+  int  drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t rgb, int size);
   int  textWidthWith(const P4Font* f, const char* s, int size) const;
+  int  startScrollSlot(int slot, int rx, int ry, int rw, int rh, int ty,
+                       const char* text, uint32_t rgb, uint16_t ms, int size);
 
   Rgb*      fb_;                   // [PANEL_H][W_]
   uint8_t*  plane_;                // [MAX_PLANES][16][W_], 6 bit: R1 G1 B1 R2 G2 B2
@@ -175,12 +211,9 @@ private:
   bool      begun_;
   const P4Font* font_;
 
-  bool      scrolling_;
-  const P4Font* scrFont_;
-  char      scrText_[240];         // UTF-8 (Vietnamese letters take 2-3 bytes)
-  int       scrX_, scrY_, scrMs_, scrSize_;
-  uint32_t  scrColor_;
-  unsigned long lastScr_;
+  bool      clipOn_;
+  int       clipX0_, clipY0_, clipX1_, clipY1_;   // clip rectangle, x1/y1 exclusive
+  Scroller  scr_[MAX_SCROLLS];
 
   P4Pins    pin_;
   uint32_t  clkSetReg_, clkClrReg_, clkBit_;

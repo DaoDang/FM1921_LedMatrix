@@ -7,6 +7,7 @@ Thư viện Arduino / PlatformIO điều khiển **bảng LED P4 32x32** bằng 
 - 24-bit RGB colour (BCM bit planes + gamma), **brightness** control / màu RGB, chỉnh độ sáng
 - Points, lines, rectangles, **5x7 text**, centred text, **scrolling text** / vẽ điểm, đường, hình chữ nhật, chữ, chữ chạy
 - **Vietnamese text (UTF-8)** with DejaVu bitmap fonts of 9 / 12 / 16 px, any size can be generated / **chữ tiếng Việt có dấu (UTF-8)** với font DejaVu 9 / 12 / 16 px, tạo thêm cỡ khác được
+- **Display areas** - clip rectangles and several independent scrolling areas, e.g. a static clock line above a scrolling date / **vùng hiển thị** riêng cho từng dòng (giờ đứng yên, ngày chạy chữ)
 - Optional **serial command console** for testing / console lệnh qua Serial để thử nghiệm
 
 > ⚠️ **Status / Tình trạng.** Tested on an **ESP32-S3** with **1 and 2 modules** only.
@@ -35,7 +36,7 @@ monitor_filters = send_on_enter
 monitor_echo = yes
 ```
 
-or copy the folder into your project's `lib/P4Panel32/`. If the build runs out of memory on Windows: `pio run -j 1`.
+or copy the folder into your project's `lib/FM1921_LedMatrix/`. If the build runs out of memory on Windows: `pio run -j 1`.
 
 ## Wiring / Đấu dây (default pins)
 
@@ -83,8 +84,9 @@ Important: the panel must be **refreshed continuously** (`show()` every `loop()`
 | Life cycle | `begin(panels, pins)`, `end()`, `setPanels(n)`, `width()`, `height()`, `panels()` |
 | Running | `show()` (= `update()` + `refresh()`), `update()`, `refresh()`, `commit()` |
 | Drawing | `clear()`, `fill(c)`, `drawPixel(x,y,c)`, `drawHLine`, `drawVLine`, `drawLine`, `drawRect`, `fillRect`, `drawColorTest()` |
-| Text | `drawChar`, `drawGlyph`, `drawText(x,y,s,c,size)`, `drawTextCentered(y,s,c,size)`, `textWidth`, `startScroll(text,y,c,ms,size)`, `stopScroll()` |
+| Text | `drawChar`, `drawGlyph`, `drawText(x,y,s,c,size)` (returns the x after the text), `drawTextCentered(y,s,c,size)`, `textWidth`, `startScroll(text,y,c,ms,size)`, `startScrollIn(x,y,w,h,text,c,ms,size)`, `stopScroll()`, `stopScroll(slot)`, `scrolling()` |
 | Fonts | `setFont(&DejaVuVN_12)` / `setFont(NULL)`, `font()`, `fontHeight()`, `fontAscent()` |
+| Areas | `setClip(x,y,w,h)`, `clearClip()`, `clearRect(x,y,w,h)` |
 | Colour | `color(r,g,b)`, `colorHSV(h,s,v)`, `parseColor("#FF8000")`, constants `P4_RED` … |
 | Appearance | `setBrightness(0..255)`, `setGamma(2.2)`, `setColorDepth(1..8)`, `setUnitTime(us)`, `setClockDelay(nops)`, `setFlipX/Y` |
 | Scan model | `setRowLines(dclk, sdin)` (0=A … 3=D), `setMarkerStep(0..15)`, `setInvertRowData(bool)`, `setChainLength(16..64)` |
@@ -124,7 +126,7 @@ void loop() { panel.show(); }
 - `y` in `drawText()` is the **top of the line cell**; the baseline is at `y + fontAscent()`. The cell is as tall as the
   tallest capital with stacked marks (Ấ, Ẫ ...), so ordinary text uses fewer rows (table). A 16 px line at `y = 0` and a 9 px line at
   `y = 32 - fontHeight()` therefore do not touch.
-- `size` (1, 2, ...) still works and scales the font by whole pixels. `startScroll()` remembers the font that is set when it is called.
+- `size` (1, 2, ...) still works and scales the font by whole pixels. `startScroll()` / `startScrollIn()` remember the font that is set when they are called.
 - Each font holds ASCII, all 134 Vietnamese letters, and `° ± × ÷ · – — ‘ ’ “ ” … • ₫ € £ ©`. A character the font lacks shows `?`.
   Invalid UTF-8 shows `?` too. Fonts only cost flash if you include them.
 - Text is not wrapped: a 64 px panel fits only a few characters of the 16 px font ("Hà Nội" = 51 px). Use `textWidth()` and `startScroll()`.
@@ -141,6 +143,46 @@ python extras/fontgen/make_vn_font.py --sizes 12 --preview preview.png --text "X
 
 See `extras/fontgen/README.md`. DejaVu licence: [NOTICE](NOTICE).
 
+## Display areas / Vùng hiển thị
+
+A panel usually shows different things in different places: a still line (the time) and a moving line (a date). Give each its own area:
+
+```cpp
+panel.setFont(&DejaVuVN_16);
+panel.setClip(0, 0, 64, 17);                    // top area: rows 0..16 - nothing drawn now can leave it
+panel.clearRect(0, 0, 64, 17);
+panel.drawText(12, -1, "17:30", P4_YELLOW);
+panel.clearClip();
+
+panel.setFont(&DejaVuVN_9);                     // bottom area: scrolls by itself inside rows 17..29
+panel.startScrollIn(0, 17, 64, 13, "DL 17-10-2026", P4_CYAN, 40);
+```
+
+- `setClip(x, y, w, h)` limits all drawing (pixels, shapes, text) to a rectangle until `clearClip()`. `clear()` ignores the clip; `clearRect()` blacks out one area.
+- `startScrollIn(x, y, w, h, text, ...)` scrolls the text inside the rectangle only: just that rectangle is redrawn (the rest of the panel
+  is not touched) and the text is clipped to it. The text line cell is centred vertically in the rectangle; use `h = fontHeight()` for an exact fit.
+  Up to `MAX_SCROLLS` (4) areas run at the same time. Calling it again for the same rectangle (a new date, say) replaces the text and
+  restarts it. It returns the slot number, or -1 if the rectangle is empty or all slots are in use; `stopScroll(slot)` stops one area.
+- `startScroll()` is unchanged: the whole panel is its area and it clears everything at every step. Do not mix it with `startScrollIn()`.
+- `drawText()` returns the x after the last glyph, so a line can be drawn in pieces (`HH`, `:`, `MM`) - for example to blink only the colon.
+- `setPanels()` stops all scrollers and removes the clip.
+
+### Clock example / Ví dụ đồng hồ - `examples/ClockRTC`
+
+A 2-module (64 x 32) clock: **HH:MM** in the 16 px font, centred and static, the `:` blinking once per second (in step with the RTC
+second); below it **`DL dd-mm-yyyy`** scrolling in the 9 px font. Time comes from an I2C real-time clock:
+
+| RTC module | ESP32-S3 |
+|---|---|
+| SDA | GPIO 10 |
+| SCL | GPIO 12 |
+| VCC / GND | 3.3 V / GND (the pull-ups on most modules go to VCC; the ESP32 pins are not 5 V tolerant) |
+
+Chips are detected automatically: DS3231 / DS1307 (0x68) and PCF8563 / BM8563 (0x51). If the RTC holds no valid time it is set to the
+build time; otherwise set it from the serial monitor (115200, Enter): `SET 2026-10-17 08:30:00`. If the RTC does not answer, the panel
+shows `Lỗi RTC` and keeps looking for it. The two areas are rows 0..16 (time) and 17..29 (date); pins, colours, speed and areas are
+constants at the top of the sketch.
+
 ### Serial console (optional)
 
 `P4Console console(panel, Serial);` → `console.begin()` in `setup()`, `console.handle()` in `loop()`.
@@ -149,12 +191,13 @@ Type `help` in the Serial Monitor (115200, Newline). Example: `pn 2; box blue; c
 ## Self test without hardware
 
 `extras/host-test/run.sh` (needs g++) runs the library against a software model of the panel and checks colours,
-brightness, chaining, flips, custom pins, and the UTF-8 / font code (glyph tables, invalid input, scrolling, the two-line layout of the Vietnamese example).
+brightness, chaining, flips, custom pins, and the UTF-8 / font code (glyph tables, invalid input, scrolling, the two-line layout of the Vietnamese example),
+clip rectangles and scrolling areas (slots, clipping, wrap, replacing a running area).
 It verifies internal consistency only – **not** real hardware behaviour.
 
 ## Examples
 
-`BasicDrawing`, `TextAndScroll`, `VietnameseText`, `SerialConsole` (in `examples/`).
+`BasicDrawing`, `TextAndScroll`, `VietnameseText`, `ClockRTC`, `SerialConsole` (in `examples/`).
 
 ## License
 

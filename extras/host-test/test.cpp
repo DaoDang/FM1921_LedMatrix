@@ -156,8 +156,8 @@ int main() {
     // scroll
     P.startScroll("TEST", 12, P4_YELLOW, 40, 1); CHECK(P.scrolling(), "scrolling");
     int seenMin = 999;
-    for (int i = 0; i < 300; i++) { g_us += 41000; P.update(); if (P.scrX_ < seenMin) seenMin = P.scrX_; }
-    CHECK(seenMin < 0 && P.scrX_ <= 64, "scroll moved & wrapped"); P.stopScroll(); CHECK(!P.scrolling(), "stop");
+    for (int i = 0; i < 300; i++) { g_us += 41000; P.update(); if (P.scr_[0].x < seenMin) seenMin = P.scr_[0].x; }
+    CHECK(seenMin < 0 && P.scr_[0].x <= 64, "scroll moved & wrapped"); P.stopScroll(); CHECK(!P.scrolling(), "stop");
 
     // ---------- Vietnamese / UTF-8 fonts ----------
     {
@@ -233,14 +233,106 @@ int main() {
       P.setFont(&DejaVuVN_16);
       std::string longText; while (longText.size() < 400) longText += "Việt Nam ";
       P.startScroll(longText.c_str(), 5, P4_YELLOW, 40);
-      CHECK(P.scrFont_ == &DejaVuVN_16 && validUtf8(P.scrText_) && strlen(P.scrText_) > 200, "startScroll keeps font, cuts at a UTF-8 boundary");
+      CHECK(P.scr_[0].font == &DejaVuVN_16 && validUtf8(P.scr_[0].text) && strlen(P.scr_[0].text) > 200, "startScroll keeps font, cuts at a UTF-8 boundary");
       P.setFont(NULL);                                                 // later setFont() does not change a running scroll
       P.startScroll("Hà Nội", 5, P4_YELLOW, 40);                      // 5x7 now
-      CHECK(P.scrFont_ == NULL, "scroll font follows setFont at call time");
+      CHECK(P.scr_[0].font == NULL, "scroll font follows setFont at call time");
       P.setFont(&DejaVuVN_16); P.startScroll("Hà Nội", 5, P4_YELLOW, 40); P.setFont(NULL);
-      int seenMin2 = 999; for (int i = 0; i < 400; i++) { g_us += 41000; P.update(); if (P.scrX_ < seenMin2) seenMin2 = P.scrX_; }
-      CHECK(seenMin2 <= -P.textWidthWith(&DejaVuVN_16, "Hà Nội", 1) && P.scrX_ <= 64, "scroll with font scrolls off and wraps");
+      int seenMin2 = 999; for (int i = 0; i < 400; i++) { g_us += 41000; P.update(); if (P.scr_[0].x < seenMin2) seenMin2 = P.scr_[0].x; }
+      CHECK(seenMin2 <= -P.textWidthWith(&DejaVuVN_16, "Hà Nội", 1) && P.scr_[0].x <= 64, "scroll with font scrolls off and wraps");
       P.stopScroll();
+      P.setFont(NULL);
+    }
+
+    // ---------- display areas: clip, clearRect, drawText return value, scrolling areas ----------
+    {
+      CHECK(P.setPanels(2), "areas: 2 modules");
+      // clipping
+      P.setFont(NULL); P.clear(); P.setClip(10, 10, 5, 4); P.fill(P4_WHITE);
+      { std::vector<char> v = snap(P); bool ok = litCount(v) == 20;
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) if (v[y * 64 + x] && !(x >= 10 && x < 15 && y >= 10 && y < 14)) ok = false;
+        CHECK(ok, "setClip limits a fill to the rectangle"); }
+      P.clearClip(); P.clear(); P.drawText(0, 0, "HELLO", P4_WHITE); std::vector<char> full = snap(P);
+      P.clear(); P.setClip(0, 0, 10, 32); P.drawText(0, 0, "HELLO", P4_WHITE); std::vector<char> part = snap(P);
+      { bool ok = litCount(part) > 0 && litCount(part) < litCount(full);
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) if (part[y * 64 + x] != (x < 10 ? full[y * 64 + x] : 0)) ok = false;
+        CHECK(ok, "clipped text = the visible part of the unclipped text"); }
+      P.clear(); P.setClip(5, 5, 0, 10); P.fill(P4_WHITE); CHECK(litCount(snap(P)) == 0, "empty clip draws nothing");
+      P.clearClip(); P.fill(P4_WHITE); P.setClip(0, 0, 4, 4); P.clear(); CHECK(litCount(snap(P)) == 0, "clear() ignores the clip");
+      P.clearClip(); P.fill(P4_WHITE); P.clearRect(8, 8, 4, 4); CHECK(litCount(snap(P)) == 64 * 32 - 16, "clearRect blacks out one area");
+      P.clear();
+
+      // drawText returns the pen position after the last glyph
+      CHECK(P.drawText(3, 0, "ABC", P4_WHITE) == 3 + 18 && P.drawText(0, 0, "", P4_WHITE) == 0 && P.drawText(0, 0, "Việt", P4_WHITE) == 24,
+            "drawText returns the pen x (5x7, characters not bytes)");
+      P.setFont(&DejaVuVN_16);
+      { const char* t = "17:30"; int adv = 0; for (const char* q = t; *q; ) adv += P4FontFind(&DejaVuVN_16, refU8(q))->adv;
+        CHECK(P.drawText(2, 0, t, P4_WHITE) == 2 + adv, "drawText returns the pen x (font)");
+        int x = P.drawText(2, 0, "17", P4_WHITE); x = P.drawText(x, 0, ":", P4_BLACK); x = P.drawText(x, 0, "30", P4_WHITE);
+        CHECK(x == 2 + adv, "split drawing HH / colon / MM keeps the layout"); }
+      { int w0 = 0; for (const char* q = "00:00"; *q; ) w0 += P4FontFind(&DejaVuVN_16, refU8(q))->adv;
+        bool same = true; const char* times[] = {"11:11", "12:34", "23:59", "08:07", "19:45", "20:00"};
+        for (const char* t : times) { int w = 0; for (const char* q = t; *q; ) w += P4FontFind(&DejaVuVN_16, refU8(q))->adv; if (w != w0) same = false; }
+        CHECK(same, "digits are tabular in DejaVuVN_16 (the clock does not jump)"); }
+
+      // scrolling inside an area
+      P.setFont(&DejaVuVN_9); P.stopScroll(); P.clear(); P.fillRect(0, 0, 64, 15, P4_BLUE);       // static band, rows 0..14
+      std::vector<char> top0 = snap(P);
+      int s0 = P.startScrollIn(0, 19, 64, 13, "DL 17-10-2026", P4_CYAN, 40);
+      CHECK(s0 == 0 && P.scrolling() && P.scr_[0].ty == 19, "startScrollIn: slot 0; a 13-row area holds the 13-row cell");
+      { bool outsideOk = true, inkSeen = false; int minX = 999, maxX = -1;
+        for (int i = 0; i < 600; i++) {
+          g_us += 41000; P.update();
+          for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) {
+            const P4Panel32::Rgb& p = P.fb_[y * 64 + x]; bool lit = (p.r | p.g | p.b) != 0;
+            if (y < 19) { if (lit != (top0[y * 64 + x] != 0)) outsideOk = false; }
+            else if (lit) { inkSeen = true; if (x < minX) minX = x; if (x > maxX) maxX = x; }
+          }
+        }
+        CHECK(outsideOk, "scroll area never touches the rest of the panel");
+        CHECK(inkSeen && minX == 0 && maxX == 63, "scroll text crosses the whole width of its area"); }
+
+      // slots
+      { int s1 = P.startScrollIn(0, 0, 64, 10, "a", P4_RED), s2 = P.startScrollIn(0, 10, 64, 9, "b", P4_RED), s3 = P.startScrollIn(10, 0, 20, 5, "c", P4_RED);
+        CHECK(s1 == 1 && s2 == 2 && s3 == 3, "new areas take slots 1, 2, 3");
+        CHECK(P.startScrollIn(1, 1, 5, 5, "d", P4_RED) == -1, "no free slot -> -1");
+        CHECK(P.startScrollIn(0, 10, 64, 9, "bb", P4_RED) == 2 && strcmp(P.scr_[2].text, "bb") == 0, "same area replaces its text (same slot)");
+        CHECK(P.startScrollIn(0, 0, 0, 5, "x", P4_RED) == -1 && P.startScrollIn(0, 0, 5, -1, "x", P4_RED) == -1, "empty area -> -1");
+        P.stopScroll(2); CHECK(!P.scr_[2].active && P.scr_[1].active && P.scrolling(), "stopScroll(slot) stops one area");
+        P.stopScroll(99); P.stopScroll(-1); CHECK(P.scr_[1].active && P.scr_[3].active, "stopScroll(bad slot) is ignored");
+        CHECK(P.startScrollIn(1, 1, 5, 5, "d", P4_RED) == 2, "a freed slot is reused");
+        P.startScroll("legacy", 5, P4_GREEN, 40);
+        CHECK(P.scr_[0].active && !P.scr_[1].active && !P.scr_[2].active && !P.scr_[3].active && P.scr_[0].rw == 64 && P.scr_[0].rh == 32 && P.scr_[0].ty == 5,
+              "startScroll = one whole-panel scroller, text top at y");
+        P.stopScroll(); CHECK(!P.scrolling(), "stopScroll() stops all"); }
+
+      // vertical centring of the text cell in the area
+      P.setFont(&DejaVuVN_16); P.startScrollIn(0, 0, 64, 32, "x", P4_RED, 40, 1);
+      CHECK(P.scr_[0].ty == (32 - 21) / 2, "text cell centred in the area (16 px font)");
+      P.stopScroll(); P.setFont(NULL); P.startScrollIn(0, 4, 64, 20, "x", P4_RED, 40, 2);
+      CHECK(P.scr_[0].ty == 4 + (20 - 14) / 2, "text cell centred in the area (5x7 at size 2)");
+      P.stopScroll();
+
+      // text taller / wider than its area stays inside it
+      P.clear(); P.setFont(&DejaVuVN_16); P.startScrollIn(8, 12, 30, 4, "HÀ NỘI 2026", P4_WHITE, 40, 1);
+      { bool clipOk = true, any = false;
+        for (int i = 0; i < 300; i++) { g_us += 41000; P.update(); std::vector<char> v = snap(P);
+          for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) if (v[y * 64 + x]) { any = true; if (x < 8 || x >= 38 || y < 12 || y >= 16) clipOk = false; } }
+        CHECK(any && clipOk, "oversized text stays inside its area"); }
+      P.stopScroll();
+
+      // start at the right edge of the area, leave at the left edge, wrap
+      P.clear(); P.setFont(&DejaVuVN_9); P.startScrollIn(10, 0, 20, 13, "Hi", P4_WHITE, 40);
+      { CHECK(P.scr_[0].x == 30, "scroll starts at the right edge of its area");
+        int tw = P.scr_[0].textW, minx = 999, prev = P.scr_[0].x; bool wrapped = false;
+        for (int i = 0; i < 400; i++) { g_us += 41000; P.update(); int x = P.scr_[0].x; if (x < minx) minx = x; if (x > prev) wrapped = true; prev = x; }
+        CHECK(minx <= 10 - tw && wrapped && P.scr_[0].x <= 30, "scroll leaves at the left edge and wraps"); }
+
+      // the caller's clip survives an update(); setPanels() resets clip and scrollers
+      P.stopScroll(); P.clear(); P.setFont(NULL); P.startScrollIn(0, 20, 64, 8, "x", P4_RED, 40);
+      P.setClip(2, 2, 3, 3); g_us += 41000; P.update();
+      CHECK(P.clipOn_ && P.clipX0_ == 2 && P.clipY0_ == 2 && P.clipX1_ == 5 && P.clipY1_ == 5, "scroller restores the caller's clip");
+      CHECK(P.setPanels(2) && !P.scrolling() && !P.clipOn_, "setPanels stops scrollers and removes the clip");
       P.setFont(NULL);
     }
 

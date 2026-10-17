@@ -32,10 +32,10 @@ P4Panel32::P4Panel32()
   : fb_(NULL), plane_(NULL), nPanels_(0), W_(0), planes_(5), unitUs_(10), bri_(255),
     gamma10_(22), spd_(3), dclkSel_(0), sdinSel_(2), mk_(0), inv_(false), chainLen_(16),
     flipX_(false), flipY_(false), dirty_(true), begun_(false), font_(NULL),
-    scrolling_(false), scrFont_(NULL), scrX_(0), scrY_(0), scrMs_(40), scrSize_(1), scrColor_(0xFFFFFF), lastScr_(0),
+    clipOn_(false), clipX0_(0), clipY0_(0), clipX1_(0), clipY1_(0),
     clkSetReg_(0), clkClrReg_(0), clkBit_(0) {
   pin_ = P4DefaultPins();
-  scrText_[0] = 0;
+  memset(scr_, 0, sizeof(scr_));
   buildGamma();
 }
 
@@ -80,7 +80,8 @@ bool P4Panel32::setPanels(uint8_t n) {
   if (!f || !q) { free(f); free(q); return false; }
   free(fb_); free(plane_);
   fb_ = f; plane_ = q; nPanels_ = np; W_ = w;
-  scrolling_ = false;
+  stopScroll();
+  clipOn_ = false;
   dirty_ = true;
   return true;
 }
@@ -138,11 +139,18 @@ void P4Panel32::clear() {
 
 void P4Panel32::drawPixel(int x, int y, uint32_t c) {
   if (!fb_ || x < 0 || x >= W_ || y < 0 || y >= PANEL_H) return;
+  if (clipOn_ && (x < clipX0_ || x >= clipX1_ || y < clipY0_ || y >= clipY1_)) return;
   Rgb& p = fb_[y * W_ + x];
   p.r = (c >> 16) & 255; p.g = (c >> 8) & 255; p.b = c & 255;
   dirty_ = true;
 }
 void P4Panel32::drawPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) { drawPixel(x, y, color(r, g, b)); }
+
+void P4Panel32::setClip(int x, int y, int w, int h) {
+  clipOn_ = true;
+  clipX0_ = x; clipY0_ = y; clipX1_ = x + w; clipY1_ = y + h;   // w or h <= 0: nothing can be drawn
+}
+void P4Panel32::clearClip() { clipOn_ = false; }
 
 void P4Panel32::fillRect(int x, int y, int w, int h, uint32_t c) {
   for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) drawPixel(x + i, y + j, c);
@@ -255,13 +263,14 @@ int P4Panel32::textWidthWith(const P4Font* f, const char* s, int sz) const {
 
 int P4Panel32::textWidth(const char* s, int sz) const { return textWidthWith(font_, s, sz); }
 
-void P4Panel32::drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t c, int sz) {
+int P4Panel32::drawTextWith(const P4Font* f, int x, int y, const char* s, uint32_t c, int sz) {
   if (sz < 1) sz = 1;
   while (*s) x += drawGlyphWith(f, x, y, utf8Next(s), c, sz);
+  return x;
 }
 
-void P4Panel32::drawText(int x, int y, const char* s, uint32_t c, int sz) {
-  drawTextWith(font_, x, y, s, c, sz);
+int P4Panel32::drawText(int x, int y, const char* s, uint32_t c, int sz) {
+  return drawTextWith(font_, x, y, s, c, sz);
 }
 
 void P4Panel32::drawTextCentered(int y, const char* s, uint32_t c, int sz) {
@@ -327,34 +336,82 @@ bool P4Panel32::parseColor(const char* s, uint32_t* out) {
 }
 
 // ---------------------------------------------------------------- scrolling text
-void P4Panel32::startScroll(const char* text, int y, uint32_t c, uint16_t ms, int sz) {
-  strncpy(scrText_, text, sizeof(scrText_) - 1);
-  scrText_[sizeof(scrText_) - 1] = 0;
-  // a long text may have been cut inside a multi-byte UTF-8 character: drop the partial one
-  size_t n = strlen(scrText_);
-  if (strlen(text) > n) {                                                    // text was cut
+// Copy a UTF-8 string into a fixed buffer; when it has to be cut, never inside a multi-byte character.
+static void copyUtf8(char* dst, size_t cap, const char* src) {
+  strncpy(dst, src, cap - 1);
+  dst[cap - 1] = 0;
+  size_t n = strlen(dst);
+  if (strlen(src) > n) {                                                     // text was cut
     size_t i = n;
-    while (i > 0 && ((uint8_t)scrText_[i - 1] & 0xC0) == 0x80) i--;          // skip continuation bytes
-    if (i > 0 && (uint8_t)scrText_[i - 1] >= 0xC0) {                         // scrText_[i-1] = lead byte
-      uint8_t lead = (uint8_t)scrText_[i - 1];
+    while (i > 0 && ((uint8_t)dst[i - 1] & 0xC0) == 0x80) i--;               // skip continuation bytes
+    if (i > 0 && (uint8_t)dst[i - 1] >= 0xC0) {                              // dst[i-1] = lead byte
+      uint8_t lead = (uint8_t)dst[i - 1];
       size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
-      if (n - (i - 1) < need) scrText_[i - 1] = 0;
+      if (n - (i - 1) < need) dst[i - 1] = 0;                                // partial character: drop it
     }
   }
-  scrFont_ = font_;
-  scrY_ = y; scrColor_ = c; scrMs_ = clampi(ms, 5, 2000); scrSize_ = clampi(sz, 1, 4);
-  scrX_ = W_; lastScr_ = 0; scrolling_ = true;
+}
+
+int P4Panel32::startScrollSlot(int slot, int rx, int ry, int rw, int rh, int ty,
+                               const char* text, uint32_t c, uint16_t ms, int sz) {
+  Scroller& s = scr_[slot];
+  s.active = false;
+  copyUtf8(s.text, sizeof(s.text), text);
+  s.font = font_;
+  s.rx = rx; s.ry = ry; s.rw = rw; s.rh = rh; s.ty = ty;
+  s.ms = clampi(ms, 5, 2000); s.size = clampi(sz, 1, 4); s.color = c;
+  s.textW = textWidthWith(s.font, s.text, s.size);
+  s.x = rx + rw;                                   // enters from the right edge of the area
+  s.last = 0;
+  s.active = true;
+  return slot;
+}
+
+void P4Panel32::startScroll(const char* text, int y, uint32_t c, uint16_t ms, int sz) {
+  stopScroll();
+  startScrollSlot(0, 0, 0, W_, PANEL_H, y, text, c, ms, sz);
+}
+
+int P4Panel32::startScrollIn(int x, int y, int w, int h, const char* text, uint32_t c, uint16_t ms, int sz) {
+  if (w <= 0 || h <= 0) return -1;
+  int slot = -1;
+  for (int i = 0; i < MAX_SCROLLS && slot < 0; i++) {                  // same area: replace its text
+    const Scroller& s = scr_[i];
+    if (s.active && s.rx == x && s.ry == y && s.rw == w && s.rh == h) slot = i;
+  }
+  for (int i = 0; i < MAX_SCROLLS && slot < 0; i++) if (!scr_[i].active) slot = i;
+  if (slot < 0) return -1;
+  int ty = y + (h - fontHeight() * clampi(sz, 1, 4)) / 2;              // text line cell centred in the area
+  return startScrollSlot(slot, x, y, w, h, ty, text, c, ms, sz);
+}
+
+void P4Panel32::stopScroll() {
+  for (int i = 0; i < MAX_SCROLLS; i++) scr_[i].active = false;
+}
+void P4Panel32::stopScroll(int slot) {
+  if (slot >= 0 && slot < MAX_SCROLLS) scr_[slot].active = false;
+}
+bool P4Panel32::scrolling() const {
+  for (int i = 0; i < MAX_SCROLLS; i++) if (scr_[i].active) return true;
+  return false;
 }
 
 void P4Panel32::updateScroll() {
-  if (!scrolling_) return;
   unsigned long now = millis();
-  if (now - lastScr_ < (unsigned long)scrMs_) return;
-  lastScr_ = now;
-  clear();
-  drawTextWith(scrFont_, scrX_, scrY_, scrText_, scrColor_, scrSize_);
-  scrX_--;
-  if (scrX_ < -textWidthWith(scrFont_, scrText_, scrSize_)) scrX_ = W_;
+  for (int i = 0; i < MAX_SCROLLS; i++) {
+    Scroller& s = scr_[i];
+    if (!s.active || now - s.last < (unsigned long)s.ms) continue;
+    s.last = now;
+    const bool on = clipOn_;                                           // the caller's clip, restored below
+    const int a = clipX0_, b = clipY0_, c = clipX1_, d = clipY1_;
+    setClip(s.rx, s.ry, s.rw, s.rh);
+    if (s.rx <= 0 && s.ry <= 0 && s.rw >= W_ && s.rh >= PANEL_H) clear();
+    else fillRect(s.rx, s.ry, s.rw, s.rh, P4_BLACK);
+    drawTextWith(s.font, s.x, s.ty, s.text, s.color, s.size);
+    clipOn_ = on; clipX0_ = a; clipY0_ = b; clipX1_ = c; clipY1_ = d;
+    s.x--;
+    if (s.x < s.rx - s.textW) s.x = s.rx + s.rw;                       // gone: start again from the right edge
+  }
 }
 
 // ---------------------------------------------------------------- image -> bit planes
