@@ -33,7 +33,7 @@ P4Panel32::P4Panel32()
     gamma10_(22), spd_(3), dclkSel_(0), sdinSel_(2), mk_(0), inv_(false), chainLen_(16),
     flipX_(false), flipY_(false), dirty_(true), begun_(false), font_(NULL),
     clipOn_(false), clipX0_(0), clipY0_(0), clipX1_(0), clipY1_(0),
-    clkSetReg_(0), clkClrReg_(0), clkBit_(0) {
+    clkSetReg_(0), clkClrReg_(0), clkBit_(0), lutOk_(false), planeBack_(NULL), backReady_(false) {
   pin_ = P4DefaultPins();
   memset(scr_, 0, sizeof(scr_));
   buildGamma();
@@ -69,6 +69,8 @@ void P4Panel32::end() {
   begun_ = false;
   free(fb_);    fb_ = NULL;
   free(plane_); plane_ = NULL;
+  free(planeBack_); planeBack_ = NULL;
+  backReady_ = false;
   nPanels_ = 0; W_ = 0;
 }
 
@@ -78,8 +80,10 @@ bool P4Panel32::setPanels(uint8_t n) {
   Rgb*     f = (Rgb*)calloc((size_t)PANEL_H * w, sizeof(Rgb));
   uint8_t* q = (uint8_t*)calloc((size_t)MAX_PLANES * 16 * w, 1);
   if (!f || !q) { free(f); free(q); return false; }
-  free(fb_); free(plane_);
-  fb_ = f; plane_ = q; nPanels_ = np; W_ = w;
+  uint8_t* qb = (uint8_t*)calloc((size_t)MAX_PLANES * 16 * w, 1);   // may fail: then single buffer
+  backReady_ = false;
+  free(fb_); free(plane_); free(planeBack_);
+  fb_ = f; plane_ = q; planeBack_ = qb; nPanels_ = np; W_ = w;
   stopScroll();
   clipOn_ = false;
   dirty_ = true;
@@ -93,6 +97,27 @@ void P4Panel32::buildGamma() {
     float f = powf(v / 255.0f, g);
     gam_[v] = (uint16_t)(f * 65535.0f + 0.5f);
   }
+  lutOk_ = false;                                               // commit() tables must be rebuilt
+}
+
+// Tables that let commit() turn one pixel pair into all its bit-plane bytes with 6 lookups
+// (instead of 6 gamma lookups + 30 shift/or steps). Same result as the old per-bit loop.
+void P4Panel32::buildLut() {
+  const int P = planes_;
+  const int sh = 16 - P;
+  const uint32_t rnd = sh > 0 ? (1u << (sh - 1)) : 0;
+  const uint32_t qmax = (1u << P) - 1;
+  for (int v = 0; v < 256; v++) {
+    uint32_t q = (gam_[v] + rnd) >> sh;
+    if (q > qmax) q = qmax;
+    q_[v] = (uint8_t)q;
+    for (int c = 0; c < 6; c++) {
+      uint32_t w = 0;
+      for (int p = 0; p < P && p < 5; p++) w |= ((q >> p) & 1u) << (6 * p + c);
+      lut_[c][v] = w;
+    }
+  }
+  lutOk_ = true;
 }
 
 void P4Panel32::buildMasks() {
@@ -122,7 +147,7 @@ void P4Panel32::setGamma(float g) {
   buildGamma();
   dirty_ = true;
 }
-void P4Panel32::setColorDepth(uint8_t p) { planes_ = clampi(p, 1, MAX_PLANES); dirty_ = true; }
+void P4Panel32::setColorDepth(uint8_t p) { planes_ = clampi(p, 1, MAX_PLANES); lutOk_ = false; dirty_ = true; }
 void P4Panel32::setUnitTime(uint16_t us) { unitUs_ = clampi(us, 1, 50); }
 void P4Panel32::setClockDelay(uint8_t n) { spd_ = clampi(n, 0, 40); }
 bool P4Panel32::setRowLines(uint8_t d, uint8_t s) {
@@ -153,7 +178,25 @@ void P4Panel32::setClip(int x, int y, int w, int h) {
 void P4Panel32::clearClip() { clipOn_ = false; }
 
 void P4Panel32::fillRect(int x, int y, int w, int h, uint32_t c) {
-  for (int j = 0; j < h; j++) for (int i = 0; i < w; i++) drawPixel(x + i, y + j, c);
+  if (!fb_ || w <= 0 || h <= 0) return;
+  int x0 = x, y0 = y, x1 = x + w, y1 = y + h;                  // intersect with the panel and the clip
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > W_) x1 = W_;
+  if (y1 > PANEL_H) y1 = PANEL_H;
+  if (clipOn_) {
+    if (x0 < clipX0_) x0 = clipX0_;
+    if (y0 < clipY0_) y0 = clipY0_;
+    if (x1 > clipX1_) x1 = clipX1_;
+    if (y1 > clipY1_) y1 = clipY1_;
+  }
+  if (x0 >= x1 || y0 >= y1) return;
+  Rgb px; px.r = (c >> 16) & 255; px.g = (c >> 8) & 255; px.b = c & 255;
+  for (int j = y0; j < y1; j++) {
+    Rgb* row = fb_ + (size_t)j * W_;
+    for (int i = x0; i < x1; i++) row[i] = px;
+  }
+  dirty_ = true;
 }
 void P4Panel32::fill(uint32_t c) { fillRect(0, 0, W_, PANEL_H, c); }
 void P4Panel32::drawHLine(int x, int y, int w, uint32_t c) { fillRect(x, y, w, 1, c); }
@@ -363,6 +406,7 @@ int P4Panel32::startScrollSlot(int slot, int rx, int ry, int rw, int rh, int ty,
   s.textW = textWidthWith(s.font, s.text, s.size);
   s.x = rx + rw;                                   // enters from the right edge of the area
   s.last = 0;
+  s.lastFrame = frames_ - scrollFrames_;           // first step on the next call
   s.active = true;
   return slot;
 }
@@ -400,8 +444,16 @@ void P4Panel32::updateScroll() {
   unsigned long now = millis();
   for (int i = 0; i < MAX_SCROLLS; i++) {
     Scroller& s = scr_[i];
-    if (!s.active || now - s.last < (unsigned long)s.ms) continue;
-    s.last = now;
+    if (!s.active) continue;
+    if (scrollFrames_) {                                               // frame-locked: whole scan frames per step
+      const uint32_t f = frames_;
+      if ((uint32_t)(f - s.lastFrame) < scrollFrames_) continue;
+      s.lastFrame += scrollFrames_;
+      if ((uint32_t)(f - s.lastFrame) >= scrollFrames_) s.lastFrame = f;   // fell behind: drop, never burst
+    } else {
+      if (now - s.last < (unsigned long)s.ms) continue;
+      s.last = now;
+    }
     const bool on = clipOn_;                                           // the caller's clip, restored below
     const int a = clipX0_, b = clipY0_, c = clipX1_, d = clipY1_;
     setClip(s.rx, s.ry, s.rw, s.rh);
@@ -415,31 +467,67 @@ void P4Panel32::updateScroll() {
 }
 
 // ---------------------------------------------------------------- image -> bit planes
-void P4Panel32::commit() {
-  if (!fb_) return;
+// Image -> bit planes, written into dst (plane_ or planeBack_).
+void P4Panel32::convertInto(uint8_t* dst) {
+  if (!lutOk_) buildLut();
   const int P = planes_;
-  const int sh = 16 - P;
-  const uint32_t rnd = sh > 0 ? (1u << (sh - 1)) : 0;
-  const uint32_t qmax = (1u << P) - 1;
+  const int nLow = P < 5 ? P : 5;                                 // planes 0..4 come straight from the tables
+  const size_t stride = (size_t)16 * W_;                          // distance between two bit planes
   for (int y = 0; y < 16; y++) {
-    int yt = flipY_ ? 31 - y : y;
-    int yb = flipY_ ? 15 - y : y + 16;
+    const int yt = flipY_ ? 31 - y : y;
+    const int yb = flipY_ ? 15 - y : y + 16;
+    const Rgb* rt = fb_ + (size_t)yt * W_;
+    const Rgb* rb = fb_ + (size_t)yb * W_;
+    uint8_t* out = dst + (size_t)y * W_;
     for (int x = 0; x < W_; x++) {
-      int sx = flipX_ ? (W_ - 1 - x) : x;
-      const Rgb& t = fb_[yt * W_ + sx];
-      const Rgb& b = fb_[yb * W_ + sx];
-      uint32_t q[6];
-      q[0] = (gam_[t.r] + rnd) >> sh;  q[1] = (gam_[t.g] + rnd) >> sh;  q[2] = (gam_[t.b] + rnd) >> sh;
-      q[3] = (gam_[b.r] + rnd) >> sh;  q[4] = (gam_[b.g] + rnd) >> sh;  q[5] = (gam_[b.b] + rnd) >> sh;
-      for (int c = 0; c < 6; c++) if (q[c] > qmax) q[c] = qmax;
-      for (int p = 0; p < P; p++) {
-        uint8_t m = 0;
-        for (int c = 0; c < 6; c++) m |= ((q[c] >> p) & 1) << c;
-        plane_[((size_t)p * 16 + y) * W_ + x] = m;
+      const int sx = flipX_ ? (W_ - 1 - x) : x;
+      const Rgb& t = rt[sx];
+      const Rgb& b = rb[sx];
+      const uint32_t a = lut_[0][t.r] | lut_[1][t.g] | lut_[2][t.b] |
+                         lut_[3][b.r] | lut_[4][b.g] | lut_[5][b.b];
+      for (int p = 0; p < nLow; p++) out[(size_t)p * stride + x] = (uint8_t)((a >> (6 * p)) & 63u);
+      if (P > 5) {                                                // rare: more than 5 bit planes
+        const uint8_t q[6] = {q_[t.r], q_[t.g], q_[t.b], q_[b.r], q_[b.g], q_[b.b]};
+        for (int p = 5; p < P; p++) {
+          uint8_t m = 0;
+          for (int c = 0; c < 6; c++) m |= ((q[c] >> p) & 1) << c;
+          out[(size_t)p * stride + x] = m;
+        }
       }
     }
   }
+}
+
+// Direct conversion into the picture that is being scanned (single thread, blocks the scanning).
+void P4Panel32::commit() {
+  if (!fb_) return;
+  backReady_ = false;                                             // a pending picture would be older than this one
+  convertInto(plane_);
   dirty_ = false;
+}
+
+// Drawing thread: scrolling text + conversion into the second buffer. Never touches the picture being scanned.
+bool P4Panel32::prepare() {
+  if (!fb_) return false;
+  if (backReady_) return false;                                   // previous picture not taken over yet
+  __sync_synchronize();
+  updateScroll();
+  if (!dirty_) return false;
+  if (!planeBack_) { commit(); return true; }                     // single buffer fallback
+  dirty_ = false;
+  convertInto(planeBack_);
+  __sync_synchronize();                                           // planes written before the flag
+  backReady_ = true;
+  return true;
+}
+
+// Scanning thread: take over a finished picture (pointer swap, a few nanoseconds).
+void P4Panel32::swapIfReady() {
+  if (!backReady_) return;
+  __sync_synchronize();
+  uint8_t* t = plane_; plane_ = planeBack_; planeBack_ = t;
+  __sync_synchronize();                                           // swapped before the buffer is released
+  backReady_ = false;
 }
 
 // ---------------------------------------------------------------- scanning
@@ -489,11 +577,12 @@ void P4Panel32::refresh() {
     }
   }
   if (bri_ == 0) delay(5);
+  frames_ = frames_ + 1;
 }
 
 void P4Panel32::update() {
-  updateScroll();
-  if (dirty_) commit();
+  prepare();
+  swapIfReady();
 }
 
 void P4Panel32::show() {

@@ -11,7 +11,9 @@
 #include <Arduino.h>
 #include "P4Font.h"
 
-#define P4PANEL32_VERSION "1.2.0"
+#define P4PANEL32_VERSION "1.3.0"
+#define P4PANEL32_HAS_SCROLL_FRAMES 1   // setScrollFrames() / frames() available
+#define P4PANEL32_HAS_PREPARE 1      // prepare() / swapIfReady() available (double-buffered bit planes)
 
 // GPIO assignment. r1..b2 (colour data) MUST be GPIO 0..31 (fast set/clear
 // uses one 32-bit register). a,b,c,d,lat,oe,clk may be any output GPIO.
@@ -61,14 +63,31 @@ public:
   int panels() const { return nPanels_; }
 
   // ---- running ---------------------------------------------------------
-  // Call as often as possible (every loop()). = update() + refresh().
+  // One thread / simple sketches: call show() as often as possible (every loop()). = update() + refresh().
   void show();
-  // Advance scrolling text and convert the image to bit planes if it changed.
+  // Advance scrolling text and convert the image to bit planes if it changed (= prepare() + swapIfReady()).
   void update();
   // Scan ONE full frame (blocks ~ a few ms).
   void refresh();
-  // Force the conversion image -> bit planes (normally automatic).
+  // Frame-locked scrolling: step every n scan frames instead of every `ms` milliseconds (0 = use ms).
+  // Steps then land on whole frames, so the motion has no 6/7-frame jitter. frames() counts refresh() calls.
+  void     setScrollFrames(uint8_t n) { scrollFrames_ = n; }
+  uint32_t frames() const { return frames_; }
+  // Force the conversion image -> bit planes straight into the picture being scanned (normally automatic).
   void commit();
+
+  // Two threads / two cores (e.g. FreeRTOS tasks): the conversion image -> bit planes takes about a millisecond
+  // and, done inside the scanning loop, makes the LEDs go dark for that time at every change (a scrolling text
+  // changes the picture ~25 times a second: visible flicker of static text). With two bit-plane buffers the
+  // conversion runs in the DRAWING thread while the SCANNING thread keeps scanning the previous picture:
+  //   scanning thread:  loop { panel.swapIfReady(); panel.refresh(); }          // never blocked
+  //   drawing thread:   draw..., panel.prepare();   // call it often (every few ms): moves scrolling text, converts
+  // All drawing calls, setClip(), startScrollIn() and prepare() must come from the same (drawing) thread.
+  // begin()/end()/setPanels() and the set...() settings must not run while the other thread is scanning.
+  // prepare() returns true when a new picture was produced; it waits (returns false) until the previous one has
+  // been taken over by swapIfReady(). Do not mix with commit(). Falls back to a single buffer if RAM is short.
+  bool prepare();
+  void swapIfReady();
 
   // ---- drawing (x = 0 is the FARTHEST module from the ESP32, left side) -
   void clear();
@@ -178,9 +197,12 @@ private:
     int           ms, size;
     uint32_t      color;
     unsigned long last;
+    uint32_t      lastFrame;         // frame counter at the last step (frame-locked scrolling)
   };
 
   void buildGamma();
+  void buildLut();
+  void convertInto(uint8_t* dst);
   void buildMasks();
   void shiftPlane(const uint8_t* m);
   int  linePin(int line) const;
@@ -219,6 +241,15 @@ private:
   uint32_t  clkSetReg_, clkClrReg_, clkBit_;
   uint16_t  gam_[256];
   uint32_t  setMask_[64], clrMask_[64];
+  // commit() lookup tables: lut_[c][v] = bits of channel c (R1 G1 B1 R2 G2 B2) of 8-bit value v, already
+  // gamma-corrected, quantised to planes_ bits and placed in the 6-bit field of each of planes 0..4.
+  uint32_t  lut_[6][256];
+  uint8_t   q_[256];                 // gamma + quantisation of one 8-bit value (used for planes 5..7)
+  bool      lutOk_;
+  uint8_t*  planeBack_;              // second bit-plane buffer (picture being prepared), NULL = single buffer
+  volatile uint32_t frames_ = 0;     // completed refresh() calls (written by the scanning thread)
+  uint8_t  scrollFrames_ = 0;
+  volatile bool backReady_;          // planeBack_ holds a finished picture that swapIfReady() has not taken yet
 
   P4Panel32(const P4Panel32&);              // not copyable
   P4Panel32& operator=(const P4Panel32&);
